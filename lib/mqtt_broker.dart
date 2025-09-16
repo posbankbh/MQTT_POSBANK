@@ -107,6 +107,7 @@ class MqttBroker {
   /// Handle client handshake (CONNECT message)
   void _handleClientHandshake(Socket socket) {
     late StreamSubscription<Uint8List> subscription;
+    MqttClient? connectedClient; // Track the connected client
     final timeout = Timer(Duration(seconds: 30), () {
       print('Connection timeout from ${socket.remoteAddress.address}:${socket.remotePort}');
       socket.close();
@@ -117,16 +118,24 @@ class MqttBroker {
     subscription = socket.listen(
       (Uint8List data) {
         try {
+          // If we have a connected client, forward data directly to it
+          if (connectedClient != null) {
+            connectedClient!.handleIncomingData(data);
+            return;
+          }
+
+          // Otherwise, handle handshake
           messageBuffer.addData(data);
           final messages = messageBuffer.extractMessages();
 
           if (messages.isNotEmpty) {
             timeout.cancel();
-            // Don't cancel subscription - pass it to the client
 
             final message = messages.first;
             if (message is MqttConnectMessage) {
-              _handleConnectMessage(socket, message, messageBuffer, subscription);
+              _handleConnectMessage(socket, message, messageBuffer, subscription).then((client) {
+                connectedClient = client; // Store the client for future data forwarding
+              });
             } else {
               print('Expected CONNECT message, got ${message.messageType}');
               subscription.cancel();
@@ -155,7 +164,7 @@ class MqttBroker {
   }
 
   /// Handle CONNECT message
-  Future<void> _handleConnectMessage(
+  Future<MqttClient?> _handleConnectMessage(
       Socket socket, MqttConnectMessage connectMessage, MqttMessageBuffer messageBuffer, StreamSubscription<Uint8List> subscription) async {
     final clientId = connectMessage.clientId;
 
@@ -168,7 +177,7 @@ class MqttBroker {
         socket.add(connack.toBytes());
         await socket.flush();
         socket.close();
-        return;
+        return null;
       }
       // For clean session with empty client ID, generate a unique one
       actualClientId = 'auto_${DateTime.now().millisecondsSinceEpoch}_${socket.remotePort}';
@@ -260,12 +269,16 @@ class MqttBroker {
       // Setup client message handling
       _setupClientHandling(client);
 
+      // Keep the existing subscription active - no need to change it
+
       // Resend QoS 1 and 2 messages if session present (after CONNACK)
       if (sessionPresent) {
         // Small delay to ensure CONNACK is processed before resending messages
         await Future.delayed(Duration(milliseconds: 10));
         await _resendPendingMessages(client);
       }
+
+      return client;
     } finally {
       // Complete the lock operation
       if (!operationCompleter.isCompleted) {

@@ -69,6 +69,9 @@ class MqttClient {
   /// Track if controllers are initialized
   bool _controllersInitialized = false;
 
+  /// Active socket subscription (when taken over from handshake)
+  StreamSubscription<Uint8List>? _activeSubscription;
+
   MqttClient({
     required this.socket,
     required this.clientId,
@@ -131,8 +134,17 @@ class MqttClient {
       await socket.flush();
       lastSentActivity = DateTime.now();
     } catch (e) {
-      print('Error sending message to client $clientId: $e');
-      await disconnect();
+      // Check if this is a StreamSink binding error or socket closed error
+      if (e.toString().contains('StreamSink is bound to a stream') ||
+          e.toString().contains('Bad state') ||
+          e.toString().contains('Socket is closed')) {
+        print('Socket communication error for client $clientId: $e');
+        // Mark as disconnected but don't call disconnect() to avoid recursion
+        isConnected = false;
+      } else {
+        print('Error sending message to client $clientId: $e');
+        await disconnect();
+      }
     }
   }
 
@@ -282,10 +294,14 @@ class MqttClient {
       }
     }
 
-    // Take over the existing subscription
-    subscription.onData(_handleData);
-    subscription.onError(_handleError);
-    subscription.onDone(_handleDone);
+    // Store the subscription so we can manage it properly during disconnect
+    // The broker will handle forwarding data to us
+    _activeSubscription = subscription;
+  }
+
+  /// Handle incoming data from external source (like broker handshake)
+  void handleIncomingData(Uint8List data) {
+    _handleData(data);
   }
 
   /// Handle incoming data with proper buffering
@@ -341,10 +357,26 @@ class MqttClient {
 
     isConnected = false;
 
+    // Cancel active subscription if we have one
+    try {
+      _activeSubscription?.cancel();
+      _activeSubscription = null;
+    } catch (e) {
+      print('Error canceling subscription for client $clientId: $e');
+    }
+
     try {
       await socket.close();
     } catch (e) {
-      print('Error closing socket for client $clientId: $e');
+      // Handle common socket closure errors gracefully
+      if (e.toString().contains('StreamSink is bound to a stream') ||
+          e.toString().contains('Bad state') ||
+          e.toString().contains('Socket is closed')) {
+        // Socket is already in an unusable state, just log it
+        print('Socket already in bad state for client $clientId: $e');
+      } else {
+        print('Error closing socket for client $clientId: $e');
+      }
     }
 
     // Clean up resources
