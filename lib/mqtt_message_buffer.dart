@@ -53,11 +53,22 @@ class MqttMessageBuffer {
       }
     } while (true);
 
+    // Check individual message size limit before processing
+    if (remainingLength > maxMqttMessageSize) {
+      throw Exception('Message too large: $remainingLength bytes (max: $maxMqttMessageSize)');
+    }
+
     // Calculate total message length
     final totalLength = 1 + remainingLengthBytes + remainingLength;
 
     // Check if we have the complete message
     if (_buffer.length < totalLength) return null;
+
+    // Additional safety check for total message length
+    if (totalLength > maxMqttMessageSize + 5) {
+      // +5 for max header overhead
+      throw Exception('Total message size exceeds limit: $totalLength bytes');
+    }
 
     // Extract message data
     final messageData = Uint8List.fromList(_buffer.take(totalLength).toList());
@@ -84,11 +95,14 @@ class MqttMessageBuffer {
     _buffer.clear();
   }
 
-  /// Maximum MQTT message size (256MB)
+  /// Maximum MQTT message size (256MB - per MQTT spec)
   static const int maxMqttMessageSize = 268435455;
 
+  /// Maximum buffer size before considering it an overflow (512KB)
+  static const int maxBufferSize = 524288;
+
   /// Check if buffer is getting too large (potential DoS protection)
-  bool get isBufferOverflow => _buffer.length > maxMqttMessageSize;
+  bool get isBufferOverflow => _buffer.length > maxBufferSize;
 
   /// Resynchronize buffer after malformed message detection
   void _resynchronizeBuffer() {

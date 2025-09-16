@@ -38,6 +38,9 @@ class MqttClient {
   /// Session data (persisted if cleanSession = false)
   final ClientSession session = ClientSession();
 
+  /// Cached subscription patterns for performance optimization
+  List<String>? _cachedSubscriptionPatterns;
+
   /// Message buffer for handling TCP fragmentation
   final MqttMessageBuffer _messageBuffer = MqttMessageBuffer();
 
@@ -52,16 +55,19 @@ class MqttClient {
   bool isCleanDisconnect = false;
 
   /// Stream controller for incoming messages
-  final StreamController<MqttMessage> _messageController = StreamController<MqttMessage>.broadcast();
+  late final StreamController<MqttMessage> _messageController;
 
   /// Stream of incoming messages
   Stream<MqttMessage> get messageStream => _messageController.stream;
 
   /// Stream controller for disconnection events
-  final StreamController<MqttClient> _disconnectController = StreamController<MqttClient>.broadcast();
+  late final StreamController<MqttClient> _disconnectController;
 
   /// Stream of disconnection events
   Stream<MqttClient> get disconnectStream => _disconnectController.stream;
+
+  /// Track if controllers are initialized
+  bool _controllersInitialized = false;
 
   MqttClient({
     required this.socket,
@@ -76,6 +82,9 @@ class MqttClient {
   })  : connectedAt = DateTime.now(),
         lastActivity = DateTime.now(),
         lastSentActivity = DateTime.now() {
+    // Initialize stream controllers
+    _initializeControllers();
+
     // Clear session if clean session requested
     if (cleanSession) {
       session.clear();
@@ -83,6 +92,15 @@ class MqttClient {
 
     if (startListening) {
       _startListening();
+    }
+  }
+
+  /// Initialize stream controllers safely
+  void _initializeControllers() {
+    if (!_controllersInitialized) {
+      _messageController = StreamController<MqttMessage>.broadcast();
+      _disconnectController = StreamController<MqttClient>.broadcast();
+      _controllersInitialized = true;
     }
   }
 
@@ -124,16 +142,56 @@ class MqttClient {
       throw Exception('Invalid topic filter: $topicFilter');
     }
     session.subscriptions[topicFilter] = qos;
+    _invalidateSubscriptionCache();
   }
 
   /// Unsubscribe from a topic
   void unsubscribe(String topicFilter) {
     session.subscriptions.remove(topicFilter);
+    _invalidateSubscriptionCache();
   }
 
-  /// Check if client is subscribed to a topic
+  /// Invalidate the subscription pattern cache
+  void _invalidateSubscriptionCache() {
+    _cachedSubscriptionPatterns = null;
+  }
+
+  /// Get cached subscription patterns (sorted by complexity for performance)
+  List<String> _getSubscriptionPatterns() {
+    if (_cachedSubscriptionPatterns == null) {
+      _cachedSubscriptionPatterns = session.subscriptions.keys.toList();
+
+      // Sort patterns for better matching performance:
+      // 1. Exact matches first (no wildcards)
+      // 2. Single-level wildcards (+) next
+      // 3. Multi-level wildcards (#) last
+      _cachedSubscriptionPatterns!.sort((a, b) {
+        final aScore = _getPatternComplexity(a);
+        final bScore = _getPatternComplexity(b);
+        return aScore.compareTo(bScore);
+      });
+    }
+    return _cachedSubscriptionPatterns!;
+  }
+
+  /// Get pattern complexity score for sorting (lower = simpler/faster to match)
+  int _getPatternComplexity(String pattern) {
+    if (!pattern.contains('+') && !pattern.contains('#')) {
+      return 0; // Exact match - fastest
+    } else if (pattern.contains('+') && !pattern.contains('#')) {
+      return 1; // Single-level wildcard
+    } else {
+      return 2; // Multi-level wildcard - slowest
+    }
+  }
+
+  /// Check if client is subscribed to a topic (optimized)
   bool isSubscribedTo(String topic) {
-    for (final pattern in session.subscriptions.keys) {
+    // Early return for empty subscriptions
+    if (session.subscriptions.isEmpty) return false;
+
+    // Use sorted patterns for faster matching
+    for (final pattern in _getSubscriptionPatterns()) {
       if (MqttMessage.matchesTopic(pattern, topic)) {
         return true;
       }
@@ -141,11 +199,15 @@ class MqttClient {
     return false;
   }
 
-  /// Get QoS level for a topic
+  /// Get QoS level for a topic (optimized)
   MqttQoS getTopicQoS(String topic) {
-    for (final entry in session.subscriptions.entries) {
-      if (MqttMessage.matchesTopic(entry.key, topic)) {
-        return entry.value;
+    // Early return for empty subscriptions
+    if (session.subscriptions.isEmpty) return MqttQoS.atMostOnce;
+
+    // Use sorted patterns for faster matching - return first match
+    for (final pattern in _getSubscriptionPatterns()) {
+      if (MqttMessage.matchesTopic(pattern, topic)) {
+        return session.subscriptions[pattern]!;
       }
     }
     return MqttQoS.atMostOnce;
@@ -250,7 +312,14 @@ class MqttClient {
       }
     } catch (e) {
       print('Error processing data from client $clientId: $e');
-      disconnect();
+      // Don't disconnect for buffer-related exceptions that are handled internally
+      if (e.toString().contains('Message too large') || e.toString().contains('Total message size exceeds limit')) {
+        print('Message size limit exceeded, continuing with next message');
+        // Clear buffer to recover from oversized message
+        _messageBuffer.clear();
+      } else {
+        disconnect();
+      }
     }
   }
 
@@ -286,18 +355,41 @@ class MqttClient {
       session.clear();
     }
 
-    // Notify disconnection
-    if (!_disconnectController.isClosed) {
+    // Notify disconnection before closing controllers
+    if (_controllersInitialized && !_disconnectController.isClosed) {
       _disconnectController.add(this);
+
+      // Give listeners a chance to process the disconnection
+      await Future.delayed(Duration(milliseconds: 10));
     }
 
-    // Close stream controllers safely
-    if (!_messageController.isClosed) {
-      await _messageController.close();
+    // Close stream controllers safely with proper cleanup
+    await _closeControllers();
+  }
+
+  /// Safely close stream controllers
+  Future<void> _closeControllers() async {
+    if (!_controllersInitialized) return;
+
+    try {
+      // Close message controller first
+      if (!_messageController.isClosed) {
+        await _messageController.close();
+      }
+    } catch (e) {
+      print('Error closing message controller for client $clientId: $e');
     }
-    if (!_disconnectController.isClosed) {
-      await _disconnectController.close();
+
+    try {
+      // Close disconnect controller
+      if (!_disconnectController.isClosed) {
+        await _disconnectController.close();
+      }
+    } catch (e) {
+      print('Error closing disconnect controller for client $clientId: $e');
     }
+
+    _controllersInitialized = false;
   }
 
   /// Get all subscriptions

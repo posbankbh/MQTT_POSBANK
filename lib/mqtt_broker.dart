@@ -17,7 +17,7 @@ class MqttBroker {
   final Map<String, MqttClient> clients = {};
 
   /// Lock for client operations to prevent race conditions
-  final Map<String, bool> _clientLocks = {};
+  final Map<String, Completer<void>> _clientLocks = {};
 
   /// Persistent sessions for non-clean session clients
   final Map<String, ClientSession> persistentSessions = {};
@@ -172,18 +172,21 @@ class MqttBroker {
       print('Generated client ID for empty client ID: $actualClientId');
     }
 
-    // Prevent race conditions during client takeover with timeout
-    final lockTimeout = DateTime.now().add(Duration(seconds: 5));
-    while (_clientLocks[actualClientId] == true) {
-      if (DateTime.now().isAfter(lockTimeout)) {
-        // Lock timeout - force remove the lock and log warning
-        print('Warning: Client lock timeout for $actualClientId, forcing lock removal');
+    // Prevent race conditions during client takeover with proper locking
+    final existingLock = _clientLocks[actualClientId];
+    if (existingLock != null && !existingLock.isCompleted) {
+      // Wait for existing operation to complete with timeout
+      try {
+        await existingLock.future.timeout(Duration(seconds: 5));
+      } catch (e) {
+        print('Warning: Client lock timeout for $actualClientId, proceeding anyway');
         _clientLocks.remove(actualClientId);
-        break;
       }
-      await Future.delayed(Duration(milliseconds: 1));
     }
-    _clientLocks[actualClientId] = true;
+
+    // Create new lock for this operation
+    final operationCompleter = Completer<void>();
+    _clientLocks[actualClientId] = operationCompleter;
 
     try {
       // Check if client is already connected
@@ -255,7 +258,12 @@ class MqttBroker {
         await _resendPendingMessages(client);
       }
     } finally {
-      // Release the lock
+      // Complete the lock operation
+      if (!operationCompleter.isCompleted) {
+        operationCompleter.complete();
+      }
+      // Remove the lock immediately after completion
+      // The completer being completed signals other waiters appropriately
       _clientLocks.remove(actualClientId);
     }
   }
@@ -289,7 +297,10 @@ class MqttBroker {
     // Listen for disconnections
     client.disconnectStream.listen(
       (disconnectedClient) {
-        _handleClientDisconnect(disconnectedClient);
+        // Handle disconnection asynchronously but don't await to avoid blocking the stream
+        _handleClientDisconnect(disconnectedClient).catchError((error) {
+          print('Error handling client disconnect for ${disconnectedClient.clientId}: $error');
+        });
       },
     );
   }
@@ -339,6 +350,20 @@ class MqttBroker {
       return;
     }
 
+    // Validate packet ID requirements per MQTT 3.1.1 spec
+    if (message.qos == MqttQoS.atMostOnce && message.packetId != null) {
+      print('Protocol violation: QoS 0 message must not have packet ID from client ${client.clientId}');
+      return;
+    }
+    if ((message.qos == MqttQoS.atLeastOnce || message.qos == MqttQoS.exactlyOnce) && message.packetId == null) {
+      print('Protocol violation: QoS ${message.qos.value} message must have packet ID from client ${client.clientId}');
+      return;
+    }
+    if (message.packetId != null && (message.packetId! < 1 || message.packetId! > 65535)) {
+      print('Protocol violation: Invalid packet ID ${message.packetId} from client ${client.clientId}');
+      return;
+    }
+
     print('Publishing message on topic "${message.topic}" from client ${client.clientId}');
 
     // Store retained message if needed
@@ -353,39 +378,41 @@ class MqttBroker {
         await _distributeMessage(message, client);
         break;
       case MqttQoS.atLeastOnce:
-        // QoS 1 - send PUBACK
-        if (message.packetId != null) {
-          final puback = MqttPubackMessage(packetId: message.packetId!);
-          await client.sendMessage(puback);
-          await _distributeMessage(message, client);
-        }
+        // QoS 1 - send PUBACK (packet ID is guaranteed to be non-null due to validation above)
+        final puback = MqttPubackMessage(packetId: message.packetId!);
+        await client.sendMessage(puback);
+        await _distributeMessage(message, client);
         break;
       case MqttQoS.exactlyOnce:
-        // QoS 2 - send PUBREC, start handshake
-        if (message.packetId != null) {
-          // Check for duplicate
-          if (client.session.receivedQoS2PacketIds.contains(message.packetId!)) {
-            // Duplicate - just send PUBREC again
-            final pubrec = MqttPubrecMessage(packetId: message.packetId!);
-            await client.sendMessage(pubrec);
-          } else {
-            // New message - store and process
-            client.session.receivedQoS2PacketIds.add(message.packetId!);
-            client.addInFlightMessage(message.packetId!, message);
-            final pubrec = MqttPubrecMessage(packetId: message.packetId!);
-            await client.sendMessage(pubrec);
-          }
-          // Message will be distributed when PUBREL is received
+        // QoS 2 - send PUBREC, start handshake (packet ID is guaranteed to be non-null)
+        // Check for duplicate
+        if (client.session.receivedQoS2PacketIds.contains(message.packetId!)) {
+          // Duplicate - just send PUBREC again
+          final pubrec = MqttPubrecMessage(packetId: message.packetId!);
+          await client.sendMessage(pubrec);
+        } else {
+          // New message - store and process
+          client.session.receivedQoS2PacketIds.add(message.packetId!);
+          client.addInFlightMessage(message.packetId!, message);
+          final pubrec = MqttPubrecMessage(packetId: message.packetId!);
+          await client.sendMessage(pubrec);
         }
+        // Message will be distributed when PUBREL is received
         break;
       case MqttQoS.reserved:
-        print('Reserved QoS level used');
+        print('Protocol violation: Reserved QoS level used by client ${client.clientId}');
         return;
     }
   }
 
   /// Handle SUBSCRIBE message
   Future<void> _handleSubscribeMessage(MqttClient client, MqttSubscribeMessage message) async {
+    // Validate packet ID (SUBSCRIBE messages MUST have a non-zero packet identifier)
+    if (message.packetId < 1 || message.packetId > 65535) {
+      print('Protocol violation: Invalid packet ID ${message.packetId} in SUBSCRIBE from client ${client.clientId}');
+      return;
+    }
+
     print('Client ${client.clientId} subscribing to ${message.topics}');
 
     final returnCodes = <int>[];
@@ -412,11 +439,24 @@ class MqttBroker {
         // Determine the QoS to use (minimum of subscription QoS and message QoS)
         final deliveryQoS = MqttQoS.fromValue(math.min(qos.value, retainedMessage.qos.value));
 
+        // Create delivery message with packet ID allocation protection
+        int? packetId;
+        if (deliveryQoS != MqttQoS.atMostOnce) {
+          try {
+            packetId = client.getNextPacketId();
+          } catch (e) {
+            print('Failed to allocate packet ID for retained message to client ${client.clientId}: $e');
+            // Fallback to QoS 0 for retained message
+            print('Downgrading retained message to QoS 0 for ${client.clientId}');
+            packetId = null;
+          }
+        }
+
         final deliveryMessage = MqttPublishMessage(
           topic: retainedMessage.topic,
-          packetId: deliveryQoS != MqttQoS.atMostOnce ? client.getNextPacketId() : null,
+          packetId: packetId,
           payload: retainedMessage.payload,
-          qos: deliveryQoS,
+          qos: packetId != null ? deliveryQoS : MqttQoS.atMostOnce,
           retain: true,
         );
 
@@ -434,6 +474,12 @@ class MqttBroker {
 
   /// Handle UNSUBSCRIBE message
   Future<void> _handleUnsubscribeMessage(MqttClient client, MqttUnsubscribeMessage message) async {
+    // Validate packet ID (UNSUBSCRIBE messages MUST have a non-zero packet identifier)
+    if (message.packetId < 1 || message.packetId > 65535) {
+      print('Protocol violation: Invalid packet ID ${message.packetId} in UNSUBSCRIBE from client ${client.clientId}');
+      return;
+    }
+
     print('Client ${client.clientId} unsubscribing from ${message.topics}');
 
     for (final topic in message.topics) {
@@ -479,18 +525,18 @@ class MqttBroker {
       client.removeInFlightMessage(message.packetId);
     }
 
-    // Clean up duplicate tracking when we send PUBCOMP (completing QoS 2 flow)
-    client.session.receivedQoS2PacketIds.remove(message.packetId);
-
     // Send PUBCOMP
     final pubcomp = MqttPubcompMessage(packetId: message.packetId);
     await client.sendMessage(pubcomp);
+
+    // Clean up duplicate tracking AFTER sending PUBCOMP (completing QoS 2 flow)
+    client.session.receivedQoS2PacketIds.remove(message.packetId);
   }
 
   /// Handle PUBCOMP message (QoS 2 complete from client)
   Future<void> _handlePubcompMessage(MqttClient client, MqttPubcompMessage message) async {
     print('Received PUBCOMP from ${client.clientId} for packet ${message.packetId}');
-    // Complete the QoS 2 flow - remove from in-flight 
+    // Complete the QoS 2 flow - remove from in-flight
     // (duplicate tracking is cleaned up when we send PUBCOMP, not when we receive it)
     client.removeInFlightMessage(message.packetId);
   }
@@ -524,35 +570,52 @@ class MqttBroker {
 
   /// Deliver message to a specific client
   Future<void> _deliverMessageToClient(MqttClient client, MqttPublishMessage message) async {
-    // Determine the QoS to use (minimum of subscription QoS and message QoS)
-    final subscriptionQoS = client.getTopicQoS(message.topic);
-    final deliveryQoS = MqttQoS.fromValue(math.min(subscriptionQoS.value, message.qos.value));
+    try {
+      // Determine the QoS to use (minimum of subscription QoS and message QoS)
+      final subscriptionQoS = client.getTopicQoS(message.topic);
+      final deliveryQoS = MqttQoS.fromValue(math.min(subscriptionQoS.value, message.qos.value));
 
-    // Create delivery message
-    final deliveryMessage = MqttPublishMessage(
-      topic: message.topic,
-      packetId: deliveryQoS != MqttQoS.atMostOnce ? client.getNextPacketId() : null,
-      payload: message.payload,
-      qos: deliveryQoS,
-      retain: false, // Retain flag is not set for normal delivery
-    );
+      // Create delivery message with packet ID allocation protection
+      int? packetId;
+      if (deliveryQoS != MqttQoS.atMostOnce) {
+        try {
+          packetId = client.getNextPacketId();
+        } catch (e) {
+          print('Failed to allocate packet ID for client ${client.clientId}: $e');
+          // Fallback to QoS 0 if we can't allocate packet ID
+          print('Downgrading to QoS 0 for message delivery to ${client.clientId}');
+          packetId = null;
+        }
+      }
 
-    // Track pending messages for QoS 1 and 2
-    if (deliveryMessage.packetId != null) {
-      client.addPendingPublish(deliveryMessage.packetId!, deliveryMessage);
+      final deliveryMessage = MqttPublishMessage(
+        topic: message.topic,
+        packetId: packetId,
+        payload: message.payload,
+        qos: packetId != null ? deliveryQoS : MqttQoS.atMostOnce,
+        retain: false, // Retain flag is not set for normal delivery
+      );
+
+      // Track pending messages for QoS 1 and 2
+      if (deliveryMessage.packetId != null) {
+        client.addPendingPublish(deliveryMessage.packetId!, deliveryMessage);
+      }
+
+      await client.sendMessage(deliveryMessage);
+      stats['messagesDelivered'] = (stats['messagesDelivered'] ?? 0) + 1;
+    } catch (e) {
+      print('Error delivering message to client ${client.clientId}: $e');
+      // Don't rethrow - continue with other clients
     }
-
-    await client.sendMessage(deliveryMessage);
-    stats['messagesDelivered'] = (stats['messagesDelivered'] ?? 0) + 1;
   }
 
   /// Handle client disconnection
-  void _handleClientDisconnect(MqttClient client) {
+  Future<void> _handleClientDisconnect(MqttClient client) async {
     print('Client ${client.clientId} disconnected');
 
     // Send will message if needed (only for abnormal disconnections)
     if (!client.isCleanDisconnect && client.willTopic != null && client.willMessage != null) {
-      _sendWillMessage(client);
+      await _sendWillMessage(client);
     }
 
     // Save persistent session if needed
@@ -570,7 +633,7 @@ class MqttBroker {
   }
 
   /// Send will message when client disconnects abnormally
-  void _sendWillMessage(MqttClient client) {
+  Future<void> _sendWillMessage(MqttClient client) async {
     if (client.willTopic == null || client.willMessage == null) return;
 
     print('Sending will message for client ${client.clientId} on topic ${client.willTopic}');
@@ -588,8 +651,12 @@ class MqttBroker {
       retainedMessages.storeMessage(client.willTopic!, willMessage);
     }
 
-    // Distribute to subscribers
-    _distributeMessage(willMessage, client);
+    // Distribute to subscribers properly
+    try {
+      await _distributeMessage(willMessage, client);
+    } catch (e) {
+      print('Error distributing will message for client ${client.clientId}: $e');
+    }
   }
 
   /// Start keep-alive monitoring
@@ -601,7 +668,10 @@ class MqttBroker {
         if (client.hasTimedOut()) {
           print('Client ${client.clientId} timed out (keep-alive)');
           clientsToRemove.add(client.clientId);
-          client.disconnect();
+          // Disconnect asynchronously but don't await to avoid blocking the timer
+          client.disconnect().catchError((error) {
+            print('Error disconnecting timed out client ${client.clientId}: $error');
+          });
         }
       }
 
