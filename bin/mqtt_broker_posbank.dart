@@ -4,7 +4,7 @@ import 'package:mqtt_broker_posbank/mqtt_broker.dart';
 
 void main(List<String> arguments) async {
   // Parse command line arguments
-  int port = 1886;
+  int port = 1887;
   String host = '0.0.0.0';
   bool showHelp = false;
 
@@ -79,7 +79,7 @@ void _printHelp() {
   print('Usage: dart run bin/mqtt_broker_posbank.dart [options]');
   print('');
   print('Options:');
-  print('  -p, --port PORT     Set the port to listen on (default: 22256)');
+  print('  -p, --port PORT     Set the port to listen on (default: 1886)');
   print('  -h, --host HOST     Set the host to bind to (default: 0.0.0.0)');
   print('  --help              Show this help message');
   print('');

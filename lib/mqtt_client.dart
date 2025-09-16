@@ -226,14 +226,24 @@ class MqttClient {
     _startListening();
   }
 
-  /// Set up client with existing message buffer from handshake
-  void setupWithBuffer(MqttMessageBuffer existingBuffer) {
-    // Transfer any remaining data from handshake buffer
+  /// Set up client with existing message buffer and stream subscription
+  void setupWithSubscription(StreamSubscription<Uint8List> subscription, MqttMessageBuffer existingBuffer) {
+    // Transfer any remaining data from handshake buffer to our buffer
     if (existingBuffer.bufferSize > 0) {
-      // Note: We'd need to expose buffer data to transfer it
-      // For now, we'll just start fresh since CONNECT was already processed
+      // We need to transfer the existing buffer data
+      // For now, we'll process any remaining messages
+      final remainingMessages = existingBuffer.extractMessages();
+      for (final message in remainingMessages) {
+        if (!_messageController.isClosed) {
+          _messageController.add(message);
+        }
+      }
     }
-    _startListening();
+
+    // Take over the existing subscription
+    subscription.onData(_handleData);
+    subscription.onError(_handleError);
+    subscription.onDone(_handleDone);
   }
 
   /// Handle incoming data with proper buffering

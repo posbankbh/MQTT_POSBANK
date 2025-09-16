@@ -99,7 +99,7 @@ class MqttBroker {
 
   /// Handle client handshake (CONNECT message)
   void _handleClientHandshake(Socket socket) {
-    late StreamSubscription subscription;
+    late StreamSubscription<Uint8List> subscription;
     final timeout = Timer(Duration(seconds: 30), () {
       print('Connection timeout from ${socket.remoteAddress.address}:${socket.remotePort}');
       socket.close();
@@ -115,13 +115,14 @@ class MqttBroker {
 
           if (messages.isNotEmpty) {
             timeout.cancel();
-            subscription.cancel();
+            // Don't cancel subscription - pass it to the client
 
             final message = messages.first;
             if (message is MqttConnectMessage) {
-              _handleConnectMessage(socket, message, messageBuffer);
+              _handleConnectMessage(socket, message, messageBuffer, subscription);
             } else {
               print('Expected CONNECT message, got ${message.messageType}');
+              subscription.cancel();
               socket.close();
             }
           }
@@ -147,7 +148,8 @@ class MqttBroker {
   }
 
   /// Handle CONNECT message
-  Future<void> _handleConnectMessage(Socket socket, MqttConnectMessage connectMessage, MqttMessageBuffer messageBuffer) async {
+  Future<void> _handleConnectMessage(
+      Socket socket, MqttConnectMessage connectMessage, MqttMessageBuffer messageBuffer, StreamSubscription<Uint8List> subscription) async {
     final clientId = connectMessage.clientId;
 
     // Validate client ID
@@ -211,8 +213,8 @@ class MqttBroker {
 
     print('Client $clientId connected (clean session: ${connectMessage.cleanSession}, session present: $sessionPresent)');
 
-    // Set up client with existing message buffer and start listening
-    client.setupWithBuffer(messageBuffer);
+    // Set up client with existing message buffer and subscription
+    client.setupWithSubscription(subscription, messageBuffer);
 
     // Setup client message handling
     _setupClientHandling(client);
