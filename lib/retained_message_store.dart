@@ -86,7 +86,7 @@ class RetainedMessageStore {
     // Handle multi-level wildcard (#)
     if (pattern.endsWith('/#')) {
       final prefix = pattern.substring(0, pattern.length - 2);
-      return topic.startsWith(prefix);
+      return topic.startsWith('$prefix/') || topic == prefix;
     }
 
     if (pattern == '#') {

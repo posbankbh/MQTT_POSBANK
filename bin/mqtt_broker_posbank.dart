@@ -4,7 +4,7 @@ import 'package:mqtt_broker_posbank/mqtt_broker.dart';
 
 void main(List<String> arguments) async {
   // Parse command line arguments
-  int port = 1887;
+  int port = 1883;
   String host = '0.0.0.0';
   bool showHelp = false;
 
@@ -79,7 +79,7 @@ void _printHelp() {
   print('Usage: dart run bin/mqtt_broker_posbank.dart [options]');
   print('');
   print('Options:');
-  print('  -p, --port PORT     Set the port to listen on (default: 1886)');
+  print('  -p, --port PORT     Set the port to listen on (default: 1883)');
   print('  -h, --host HOST     Set the host to bind to (default: 0.0.0.0)');
   print('  --help              Show this help message');
   print('');
@@ -94,7 +94,7 @@ void _setupSignalHandlers(MqttBroker broker) {
   ProcessSignal.sigint.watch().listen((signal) async {
     print('\nReceived SIGINT, shutting down gracefully...');
     await broker.stop();
-    exit(0);
+    _shutdownCompleter?.complete();
   });
 
   // Handle SIGTERM only on platforms that support it (Unix-like systems)
@@ -103,7 +103,7 @@ void _setupSignalHandlers(MqttBroker broker) {
       ProcessSignal.sigterm.watch().listen((signal) async {
         print('\nReceived SIGTERM, shutting down gracefully...');
         await broker.stop();
-        exit(0);
+        _shutdownCompleter?.complete();
       });
     } catch (e) {
       print('Warning: SIGTERM handling not available: $e');
@@ -128,11 +128,14 @@ void _printStatus(MqttBroker broker) {
   print('-------------------------');
 }
 
+// Global completer for shutdown signaling
+Completer<void>? _shutdownCompleter;
+
 Future<void> _waitForShutdown() async {
   // Create a completer that will complete when we want to shutdown
-  final completer = Completer<void>();
+  _shutdownCompleter = Completer<void>();
 
   // This will keep the application running until explicitly completed
   // The signal handlers will complete this when shutdown is requested
-  return completer.future;
+  return _shutdownCompleter!.future;
 }

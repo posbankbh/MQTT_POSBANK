@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:async';
 import 'dart:typed_data';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'mqtt_client.dart';
 import 'mqtt_message.dart';
@@ -12,8 +13,11 @@ class MqttBroker {
   final int port;
   final String host;
 
-  /// Connected clients
+  /// Connected clients (synchronized access)
   final Map<String, MqttClient> clients = {};
+
+  /// Lock for client operations to prevent race conditions
+  final Map<String, bool> _clientLocks = {};
 
   /// Persistent sessions for non-clean session clients
   final Map<String, ClientSession> persistentSessions = {};
@@ -154,7 +158,15 @@ class MqttBroker {
 
     // Validate client ID
     if (clientId.isEmpty) {
-      // Generate client ID or reject
+      // According to MQTT 3.1.1, zero-length client ID is only allowed with clean session
+      if (!connectMessage.cleanSession) {
+        final connack = MqttConnackMessage(returnCode: 2); // Identifier rejected
+        socket.add(connack.toBytes());
+        await socket.flush();
+        socket.close();
+        return;
+      }
+      // For clean session with empty client ID, we could generate one, but for now reject
       final connack = MqttConnackMessage(returnCode: 2); // Identifier rejected
       socket.add(connack.toBytes());
       await socket.flush();
@@ -162,68 +174,84 @@ class MqttBroker {
       return;
     }
 
-    // Check if client is already connected
-    final existingClient = clients[clientId];
-    bool sessionPresent = false;
-
-    if (existingClient != null) {
-      // Client takeover - disconnect existing connection
-      print('Client takeover for $clientId');
-      await existingClient.disconnect();
-      clients.remove(clientId);
+    // Prevent race conditions during client takeover
+    while (_clientLocks[clientId] == true) {
+      await Future.delayed(Duration(milliseconds: 1));
     }
+    _clientLocks[clientId] = true;
 
-    // Check for persistent session
-    if (!connectMessage.cleanSession) {
-      sessionPresent = persistentSessions.containsKey(clientId);
-    } else {
-      // Clean session - remove any persistent session
-      persistentSessions.remove(clientId);
-    }
+    try {
+      // Check if client is already connected
+      final existingClient = clients[clientId];
+      bool sessionPresent = false;
 
-    // Create new client without starting to listen (we'll handle that manually)
-    final client = MqttClient(
-      socket: socket,
-      clientId: clientId,
-      cleanSession: connectMessage.cleanSession,
-      keepAlive: connectMessage.keepAlive,
-      startListening: false,
-    );
+      if (existingClient != null) {
+        // Client takeover - disconnect existing connection
+        print('Client takeover for $clientId');
+        await existingClient.disconnect();
+        clients.remove(clientId);
+      }
 
-    // Restore persistent session if available
-    if (!connectMessage.cleanSession && persistentSessions.containsKey(clientId)) {
-      final persistentSession = persistentSessions[clientId]!;
-      // Copy persistent session data to client
-      client.session.subscriptions.addAll(persistentSession.subscriptions);
-      client.session.pendingPublishes.addAll(persistentSession.pendingPublishes);
-      client.session.inFlightMessages.addAll(persistentSession.inFlightMessages);
-      client.session.lastPacketId = persistentSession.lastPacketId;
-    }
+      // Check for persistent session
+      if (!connectMessage.cleanSession) {
+        sessionPresent = persistentSessions.containsKey(clientId);
+      } else {
+        // Clean session - remove any persistent session
+        persistentSessions.remove(clientId);
+      }
 
-    // Add client to active clients
-    clients[clientId] = client;
-    stats['currentConnections'] = clients.length;
+      // Create new client without starting to listen (we'll handle that manually)
+      final client = MqttClient(
+        socket: socket,
+        clientId: clientId,
+        cleanSession: connectMessage.cleanSession,
+        keepAlive: connectMessage.keepAlive,
+        willTopic: connectMessage.willTopic,
+        willMessage: connectMessage.willMessage,
+        willQoS: connectMessage.willQoS,
+        willRetain: connectMessage.willRetain,
+        startListening: false,
+      );
 
-    // Send CONNACK first (required by MQTT spec)
-    final connack = MqttConnackMessage(
-      sessionPresent: sessionPresent,
-      returnCode: 0, // Connection accepted
-    );
-    await client.sendMessage(connack);
+      // Restore persistent session if available
+      if (!connectMessage.cleanSession && persistentSessions.containsKey(clientId)) {
+        final persistentSession = persistentSessions[clientId]!;
+        // Copy persistent session data to client
+        client.session.subscriptions.addAll(persistentSession.subscriptions);
+        client.session.pendingPublishes.addAll(persistentSession.pendingPublishes);
+        client.session.inFlightMessages.addAll(persistentSession.inFlightMessages);
+        client.session.receivedQoS2PacketIds.addAll(persistentSession.receivedQoS2PacketIds);
+        client.session.lastPacketId = persistentSession.lastPacketId;
+      }
 
-    print('Client $clientId connected (clean session: ${connectMessage.cleanSession}, session present: $sessionPresent)');
+      // Add client to active clients
+      clients[clientId] = client;
+      stats['currentConnections'] = clients.length;
 
-    // Set up client with existing message buffer and subscription
-    client.setupWithSubscription(subscription, messageBuffer);
+      // Send CONNACK first (required by MQTT spec)
+      final connack = MqttConnackMessage(
+        sessionPresent: sessionPresent,
+        returnCode: 0, // Connection accepted
+      );
+      await client.sendMessage(connack);
 
-    // Setup client message handling
-    _setupClientHandling(client);
+      print('Client $clientId connected (clean session: ${connectMessage.cleanSession}, session present: $sessionPresent)');
 
-    // Resend QoS 1 and 2 messages if session present (after CONNACK)
-    if (sessionPresent) {
-      // Small delay to ensure CONNACK is processed before resending messages
-      await Future.delayed(Duration(milliseconds: 10));
-      await _resendPendingMessages(client);
+      // Set up client with existing message buffer and subscription
+      client.setupWithSubscription(subscription, messageBuffer);
+
+      // Setup client message handling
+      _setupClientHandling(client);
+
+      // Resend QoS 1 and 2 messages if session present (after CONNACK)
+      if (sessionPresent) {
+        // Small delay to ensure CONNACK is processed before resending messages
+        await Future.delayed(Duration(milliseconds: 10));
+        await _resendPendingMessages(client);
+      }
+    } finally {
+      // Release the lock
+      _clientLocks.remove(clientId);
     }
   }
 
@@ -330,9 +358,18 @@ class MqttBroker {
       case MqttQoS.exactlyOnce:
         // QoS 2 - send PUBREC, start handshake
         if (message.packetId != null) {
-          client.addInFlightMessage(message.packetId!, message);
-          final pubrec = MqttPubrecMessage(packetId: message.packetId!);
-          await client.sendMessage(pubrec);
+          // Check for duplicate
+          if (client.session.receivedQoS2PacketIds.contains(message.packetId!)) {
+            // Duplicate - just send PUBREC again
+            final pubrec = MqttPubrecMessage(packetId: message.packetId!);
+            await client.sendMessage(pubrec);
+          } else {
+            // New message - store and process
+            client.session.receivedQoS2PacketIds.add(message.packetId!);
+            client.addInFlightMessage(message.packetId!, message);
+            final pubrec = MqttPubrecMessage(packetId: message.packetId!);
+            await client.sendMessage(pubrec);
+          }
           // Message will be distributed when PUBREL is received
         }
         break;
@@ -445,8 +482,9 @@ class MqttBroker {
   /// Handle PUBCOMP message (QoS 2 complete from client)
   Future<void> _handlePubcompMessage(MqttClient client, MqttPubcompMessage message) async {
     print('Received PUBCOMP from ${client.clientId} for packet ${message.packetId}');
-    // Complete the QoS 2 flow - remove from in-flight
+    // Complete the QoS 2 flow - remove from in-flight and clear duplicate tracking
     client.removeInFlightMessage(message.packetId);
+    client.session.receivedQoS2PacketIds.remove(message.packetId);
   }
 
   /// Handle PINGREQ message
@@ -459,6 +497,8 @@ class MqttBroker {
   /// Handle DISCONNECT message
   Future<void> _handleDisconnectMessage(MqttClient client, MqttDisconnectMessage message) async {
     print('Client ${client.clientId} sent DISCONNECT');
+    // Mark as clean disconnect - don't send will message
+    client.isCleanDisconnect = true;
     await client.disconnect();
   }
 
@@ -502,17 +542,46 @@ class MqttBroker {
   void _handleClientDisconnect(MqttClient client) {
     print('Client ${client.clientId} disconnected');
 
+    // Send will message if needed (only for abnormal disconnections)
+    if (!client.isCleanDisconnect && client.willTopic != null && client.willMessage != null) {
+      _sendWillMessage(client);
+    }
+
     // Save persistent session if needed
     if (!client.cleanSession) {
       persistentSessions[client.clientId] = ClientSession()
         ..subscriptions.addAll(client.session.subscriptions)
         ..pendingPublishes.addAll(client.session.pendingPublishes)
         ..inFlightMessages.addAll(client.session.inFlightMessages)
+        ..receivedQoS2PacketIds.addAll(client.session.receivedQoS2PacketIds)
         ..lastPacketId = client.session.lastPacketId;
     }
 
     clients.remove(client.clientId);
     stats['currentConnections'] = clients.length;
+  }
+
+  /// Send will message when client disconnects abnormally
+  void _sendWillMessage(MqttClient client) {
+    if (client.willTopic == null || client.willMessage == null) return;
+
+    print('Sending will message for client ${client.clientId} on topic ${client.willTopic}');
+
+    final willPayload = Uint8List.fromList(utf8.encode(client.willMessage!));
+    final willMessage = MqttPublishMessage(
+      topic: client.willTopic!,
+      payload: willPayload,
+      qos: client.willQoS,
+      retain: client.willRetain,
+    );
+
+    // Store as retained if needed
+    if (client.willRetain) {
+      retainedMessages.storeMessage(client.willTopic!, willMessage);
+    }
+
+    // Distribute to subscribers
+    _distributeMessage(willMessage, client);
   }
 
   /// Start keep-alive monitoring

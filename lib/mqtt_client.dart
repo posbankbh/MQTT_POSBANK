@@ -9,12 +9,14 @@ class ClientSession {
   final Map<String, MqttQoS> subscriptions = {};
   final Map<int, MqttPublishMessage> pendingPublishes = {};
   final Map<int, MqttPublishMessage> inFlightMessages = {};
+  final Set<int> receivedQoS2PacketIds = {};
   int lastPacketId = 0;
 
   void clear() {
     subscriptions.clear();
     pendingPublishes.clear();
     inFlightMessages.clear();
+    receivedQoS2PacketIds.clear();
     lastPacketId = 0;
   }
 }
@@ -26,6 +28,12 @@ class MqttClient {
   final bool cleanSession;
   final int keepAlive;
   final DateTime connectedAt;
+
+  /// Will message information
+  final String? willTopic;
+  final String? willMessage;
+  final MqttQoS willQoS;
+  final bool willRetain;
 
   /// Session data (persisted if cleanSession = false)
   final ClientSession session = ClientSession();
@@ -41,6 +49,7 @@ class MqttClient {
 
   /// Client state
   bool isConnected = true;
+  bool isCleanDisconnect = false;
 
   /// Stream controller for incoming messages
   final StreamController<MqttMessage> _messageController = StreamController<MqttMessage>.broadcast();
@@ -59,6 +68,10 @@ class MqttClient {
     required this.clientId,
     required this.cleanSession,
     required this.keepAlive,
+    this.willTopic,
+    this.willMessage,
+    this.willQoS = MqttQoS.atMostOnce,
+    this.willRetain = false,
     bool startListening = true,
   })  : connectedAt = DateTime.now(),
         lastActivity = DateTime.now(),

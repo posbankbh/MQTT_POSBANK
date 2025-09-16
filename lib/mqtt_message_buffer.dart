@@ -84,8 +84,11 @@ class MqttMessageBuffer {
     _buffer.clear();
   }
 
+  /// Maximum MQTT message size (256MB)
+  static const int maxMqttMessageSize = 268435455;
+
   /// Check if buffer is getting too large (potential DoS protection)
-  bool get isBufferOverflow => _buffer.length > 268435455; // Max MQTT message size
+  bool get isBufferOverflow => _buffer.length > maxMqttMessageSize;
 
   /// Resynchronize buffer after malformed message detection
   void _resynchronizeBuffer() {
