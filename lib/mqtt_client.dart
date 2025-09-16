@@ -128,8 +128,24 @@ class MqttClient {
   Future<void> sendMessage(MqttMessage message) async {
     if (!isConnected) return;
 
-    final bytes = message.toBytes();
-    socket.add(bytes);
+    try {
+      final bytes = message.toBytes();
+      socket.add(bytes);
+      await socket.flush();
+      lastSentActivity = DateTime.now();
+    } catch (e) {
+      // Check if this is a StreamSink binding error or socket closed error
+      if (e.toString().contains('StreamSink is bound to a stream') ||
+          e.toString().contains('Bad state') ||
+          e.toString().contains('Socket is closed')) {
+        print('Socket communication error for client $clientId: $e');
+        // Mark as disconnected but don't call disconnect() to avoid recursion
+        isConnected = false;
+      } else {
+        print('Error sending message to client $clientId: $e');
+        await disconnect();
+      }
+    }
   }
 
   /// Subscribe to a topic
