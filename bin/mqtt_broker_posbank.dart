@@ -1,6 +1,6 @@
 import 'dart:io';
 import 'dart:async';
-import 'package:mqtt_broker_posbank/mqtt_broker.dart';
+import 'package:mqtt_broker/mqtt_broker.dart';
 
 void main(List<String> arguments) async {
   // Parse command line arguments
