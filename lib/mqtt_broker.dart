@@ -22,6 +22,9 @@ class MqttBroker {
   /// Persistent sessions for non-clean session clients
   final Map<String, ClientSession> persistentSessions = {};
 
+  /// Track when persistent sessions were last accessed for cleanup
+  final Map<String, DateTime> persistentSessionAccessTimes = {};
+
   /// Retained message store
   final RetainedMessageStore retainedMessages = RetainedMessageStore();
 
@@ -206,6 +209,7 @@ class MqttBroker {
       } else {
         // Clean session - remove any persistent session
         persistentSessions.remove(actualClientId);
+        persistentSessionAccessTimes.remove(actualClientId);
       }
 
       // Create new client without starting to listen (we'll handle that manually)
@@ -230,6 +234,11 @@ class MqttBroker {
         client.session.inFlightMessages.addAll(persistentSession.inFlightMessages);
         client.session.receivedQoS2PacketIds.addAll(persistentSession.receivedQoS2PacketIds);
         client.session.lastPacketId = persistentSession.lastPacketId;
+
+        // Remove the persistent session since it's now active
+        persistentSessions.remove(actualClientId);
+        persistentSessionAccessTimes.remove(actualClientId);
+        print('Restored persistent session for $actualClientId');
       }
 
       // Add client to active clients
@@ -626,6 +635,7 @@ class MqttBroker {
         ..inFlightMessages.addAll(client.session.inFlightMessages)
         ..receivedQoS2PacketIds.addAll(client.session.receivedQoS2PacketIds)
         ..lastPacketId = client.session.lastPacketId;
+      persistentSessionAccessTimes[client.clientId] = DateTime.now();
     }
 
     clients.remove(client.clientId);
@@ -679,10 +689,40 @@ class MqttBroker {
         clients.remove(clientId);
       }
 
+      // Clean up old persistent sessions (older than 24 hours)
+      _cleanupOldPersistentSessions();
+
       if (clientsToRemove.isNotEmpty) {
         stats['currentConnections'] = clients.length;
       }
     });
+  }
+
+  /// Clean up old persistent sessions to prevent memory leak
+  void _cleanupOldPersistentSessions() {
+    final now = DateTime.now();
+    final maxAge = Duration(hours: 24); // MQTT spec suggests 24 hours as default
+    final sessionsToRemove = <String>[];
+
+    for (final entry in persistentSessionAccessTimes.entries) {
+      final clientId = entry.key;
+      final lastAccessTime = entry.value;
+
+      // If session hasn't been accessed for more than maxAge and client isn't connected
+      if (now.difference(lastAccessTime) > maxAge && !clients.containsKey(clientId)) {
+        sessionsToRemove.add(clientId);
+      }
+    }
+
+    for (final clientId in sessionsToRemove) {
+      persistentSessions.remove(clientId);
+      persistentSessionAccessTimes.remove(clientId);
+      print('Cleaned up persistent session for inactive client: $clientId');
+    }
+
+    if (sessionsToRemove.isNotEmpty) {
+      print('Cleaned up ${sessionsToRemove.length} old persistent sessions');
+    }
   }
 
   /// Get broker statistics
