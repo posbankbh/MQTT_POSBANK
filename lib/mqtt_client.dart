@@ -134,7 +134,7 @@ class MqttClient {
   /// Check if client is subscribed to a topic
   bool isSubscribedTo(String topic) {
     for (final pattern in session.subscriptions.keys) {
-      if (_matchesTopic(pattern, topic)) {
+      if (MqttMessage.matchesTopic(pattern, topic)) {
         return true;
       }
     }
@@ -144,44 +144,11 @@ class MqttClient {
   /// Get QoS level for a topic
   MqttQoS getTopicQoS(String topic) {
     for (final entry in session.subscriptions.entries) {
-      if (_matchesTopic(entry.key, topic)) {
+      if (MqttMessage.matchesTopic(entry.key, topic)) {
         return entry.value;
       }
     }
     return MqttQoS.atMostOnce;
-  }
-
-  /// Check if topic matches a subscription pattern
-  bool _matchesTopic(String pattern, String topic) {
-    // Handle single-level wildcard (+)
-    if (pattern.contains('+')) {
-      final patternParts = pattern.split('/');
-      final topicParts = topic.split('/');
-
-      if (patternParts.length != topicParts.length) {
-        return false;
-      }
-
-      for (int i = 0; i < patternParts.length; i++) {
-        if (patternParts[i] != '+' && patternParts[i] != topicParts[i]) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    // Handle multi-level wildcard (#)
-    if (pattern.endsWith('/#')) {
-      final prefix = pattern.substring(0, pattern.length - 2);
-      return topic.startsWith('$prefix/') || topic == prefix;
-    }
-
-    if (pattern == '#') {
-      return true;
-    }
-
-    // Exact match
-    return pattern == topic;
   }
 
   /// Add pending publish for QoS 1/2

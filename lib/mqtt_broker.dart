@@ -157,6 +157,7 @@ class MqttBroker {
     final clientId = connectMessage.clientId;
 
     // Validate client ID
+    String actualClientId = clientId;
     if (clientId.isEmpty) {
       // According to MQTT 3.1.1, zero-length client ID is only allowed with clean session
       if (!connectMessage.cleanSession) {
@@ -166,44 +167,48 @@ class MqttBroker {
         socket.close();
         return;
       }
-      // For clean session with empty client ID, we could generate one, but for now reject
-      final connack = MqttConnackMessage(returnCode: 2); // Identifier rejected
-      socket.add(connack.toBytes());
-      await socket.flush();
-      socket.close();
-      return;
+      // For clean session with empty client ID, generate a unique one
+      actualClientId = 'auto_${DateTime.now().millisecondsSinceEpoch}_${socket.remotePort}';
+      print('Generated client ID for empty client ID: $actualClientId');
     }
 
-    // Prevent race conditions during client takeover
-    while (_clientLocks[clientId] == true) {
+    // Prevent race conditions during client takeover with timeout
+    final lockTimeout = DateTime.now().add(Duration(seconds: 5));
+    while (_clientLocks[actualClientId] == true) {
+      if (DateTime.now().isAfter(lockTimeout)) {
+        // Lock timeout - force remove the lock and log warning
+        print('Warning: Client lock timeout for $actualClientId, forcing lock removal');
+        _clientLocks.remove(actualClientId);
+        break;
+      }
       await Future.delayed(Duration(milliseconds: 1));
     }
-    _clientLocks[clientId] = true;
+    _clientLocks[actualClientId] = true;
 
     try {
       // Check if client is already connected
-      final existingClient = clients[clientId];
+      final existingClient = clients[actualClientId];
       bool sessionPresent = false;
 
       if (existingClient != null) {
         // Client takeover - disconnect existing connection
-        print('Client takeover for $clientId');
+        print('Client takeover for $actualClientId');
         await existingClient.disconnect();
-        clients.remove(clientId);
+        clients.remove(actualClientId);
       }
 
       // Check for persistent session
       if (!connectMessage.cleanSession) {
-        sessionPresent = persistentSessions.containsKey(clientId);
+        sessionPresent = persistentSessions.containsKey(actualClientId);
       } else {
         // Clean session - remove any persistent session
-        persistentSessions.remove(clientId);
+        persistentSessions.remove(actualClientId);
       }
 
       // Create new client without starting to listen (we'll handle that manually)
       final client = MqttClient(
         socket: socket,
-        clientId: clientId,
+        clientId: actualClientId,
         cleanSession: connectMessage.cleanSession,
         keepAlive: connectMessage.keepAlive,
         willTopic: connectMessage.willTopic,
@@ -214,8 +219,8 @@ class MqttBroker {
       );
 
       // Restore persistent session if available
-      if (!connectMessage.cleanSession && persistentSessions.containsKey(clientId)) {
-        final persistentSession = persistentSessions[clientId]!;
+      if (!connectMessage.cleanSession && persistentSessions.containsKey(actualClientId)) {
+        final persistentSession = persistentSessions[actualClientId]!;
         // Copy persistent session data to client
         client.session.subscriptions.addAll(persistentSession.subscriptions);
         client.session.pendingPublishes.addAll(persistentSession.pendingPublishes);
@@ -225,7 +230,7 @@ class MqttBroker {
       }
 
       // Add client to active clients
-      clients[clientId] = client;
+      clients[actualClientId] = client;
       stats['currentConnections'] = clients.length;
 
       // Send CONNACK first (required by MQTT spec)
@@ -235,7 +240,7 @@ class MqttBroker {
       );
       await client.sendMessage(connack);
 
-      print('Client $clientId connected (clean session: ${connectMessage.cleanSession}, session present: $sessionPresent)');
+      print('Client $actualClientId connected (clean session: ${connectMessage.cleanSession}, session present: $sessionPresent)');
 
       // Set up client with existing message buffer and subscription
       client.setupWithSubscription(subscription, messageBuffer);
@@ -251,7 +256,7 @@ class MqttBroker {
       }
     } finally {
       // Release the lock
-      _clientLocks.remove(clientId);
+      _clientLocks.remove(actualClientId);
     }
   }
 
@@ -474,6 +479,9 @@ class MqttBroker {
       client.removeInFlightMessage(message.packetId);
     }
 
+    // Clean up duplicate tracking when we send PUBCOMP (completing QoS 2 flow)
+    client.session.receivedQoS2PacketIds.remove(message.packetId);
+
     // Send PUBCOMP
     final pubcomp = MqttPubcompMessage(packetId: message.packetId);
     await client.sendMessage(pubcomp);
@@ -482,9 +490,9 @@ class MqttBroker {
   /// Handle PUBCOMP message (QoS 2 complete from client)
   Future<void> _handlePubcompMessage(MqttClient client, MqttPubcompMessage message) async {
     print('Received PUBCOMP from ${client.clientId} for packet ${message.packetId}');
-    // Complete the QoS 2 flow - remove from in-flight and clear duplicate tracking
+    // Complete the QoS 2 flow - remove from in-flight 
+    // (duplicate tracking is cleaned up when we send PUBCOMP, not when we receive it)
     client.removeInFlightMessage(message.packetId);
-    client.session.receivedQoS2PacketIds.remove(message.packetId);
   }
 
   /// Handle PINGREQ message

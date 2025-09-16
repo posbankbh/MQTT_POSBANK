@@ -219,6 +219,39 @@ abstract class MqttMessage {
     }
     return true;
   }
+
+  /// Check if topic matches a subscription pattern
+  static bool matchesTopic(String pattern, String topic) {
+    // Handle single-level wildcard (+)
+    if (pattern.contains('+')) {
+      final patternParts = pattern.split('/');
+      final topicParts = topic.split('/');
+
+      if (patternParts.length != topicParts.length) {
+        return false;
+      }
+
+      for (int i = 0; i < patternParts.length; i++) {
+        if (patternParts[i] != '+' && patternParts[i] != topicParts[i]) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Handle multi-level wildcard (#)
+    if (pattern.endsWith('/#')) {
+      final prefix = pattern.substring(0, pattern.length - 2);
+      return topic.startsWith('$prefix/') || topic == prefix;
+    }
+
+    if (pattern == '#') {
+      return true;
+    }
+
+    // Exact match
+    return pattern == topic;
+  }
 }
 
 /// MQTT CONNECT message

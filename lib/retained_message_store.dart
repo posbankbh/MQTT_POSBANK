@@ -33,7 +33,7 @@ class RetainedMessageStore {
       final topic = entry.key;
       final message = entry.value;
 
-      if (_matchesTopic(topicFilter, topic)) {
+      if (MqttMessage.matchesTopic(topicFilter, topic)) {
         matchingMessages.add(message);
       }
     }
@@ -63,39 +63,6 @@ class RetainedMessageStore {
 
   /// Get total number of retained messages
   int get count => _retainedMessages.length;
-
-  /// Check if topic matches a subscription pattern
-  bool _matchesTopic(String pattern, String topic) {
-    // Handle single-level wildcard (+)
-    if (pattern.contains('+')) {
-      final patternParts = pattern.split('/');
-      final topicParts = topic.split('/');
-
-      if (patternParts.length != topicParts.length) {
-        return false;
-      }
-
-      for (int i = 0; i < patternParts.length; i++) {
-        if (patternParts[i] != '+' && patternParts[i] != topicParts[i]) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    // Handle multi-level wildcard (#)
-    if (pattern.endsWith('/#')) {
-      final prefix = pattern.substring(0, pattern.length - 2);
-      return topic.startsWith('$prefix/') || topic == prefix;
-    }
-
-    if (pattern == '#') {
-      return true;
-    }
-
-    // Exact match
-    return pattern == topic;
-  }
 
   /// Get statistics about retained messages
   Map<String, dynamic> getStats() {

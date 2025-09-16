@@ -46,6 +46,7 @@ void main(List<String> arguments) async {
 
   // Create and start the broker
   final broker = MqttBroker(host: host, port: port);
+  Timer? statusTimer;
 
   try {
     await broker.start();
@@ -54,7 +55,7 @@ void main(List<String> arguments) async {
     _setupSignalHandlers(broker);
 
     // Print status every 30 seconds
-    Timer.periodic(Duration(seconds: 30), (timer) {
+    statusTimer = Timer.periodic(Duration(seconds: 30), (timer) {
       _printStatus(broker);
     });
 
@@ -68,6 +69,8 @@ void main(List<String> arguments) async {
     print('Error starting broker: $e');
     exit(1);
   } finally {
+    // Clean up timer
+    statusTimer?.cancel();
     await broker.stop();
     print('Broker stopped.');
   }
